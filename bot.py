@@ -7,6 +7,7 @@ import html
 import logging
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -14,7 +15,15 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    CallbackQuery,
+    FSInputFile,
+    Message,
+    ReplyKeyboardRemove,
+)
 
 import config
 import db
@@ -48,11 +57,18 @@ def service_title(code: str) -> str:
     return f"{title} ({price} грн)"
 
 
+DIVIDER = "━━━━━━━━━━━━━━"
+
+
 def booking_text(b) -> str:
+    """Картка запису: однаково виглядає в клієнта й адміна."""
+    title, price = config.SERVICES.get(b["service"], (b["service"], 0))
     return (
-        f"💈 {service_title(b['service'])}\n"
-        f"📅 {human_date(b['date'])} о {b['time']}\n"
-        f"👤 {html.escape(b['name'])}, {html.escape(b['phone'])}"
+        f"💈 <b>{title}</b>\n"
+        f"{DIVIDER}\n"
+        f"📅  {human_date(b['date'])} · <b>{b['time']}</b>\n"
+        f"💰  {price} грн\n"
+        f"👤  {html.escape(b['name'])} · {html.escape(b['phone'])}"
     )
 
 
@@ -67,14 +83,27 @@ async def notify_admin(bot: Bot, text: str) -> None:
 
 # ---------- Головне меню ----------
 
+BANNER_PATH = Path(__file__).with_name("assets") / "banner.png"
+_banner_file_id: str | None = None  # після першого надсилання Telegram дає id, щоб не завантажувати файл щоразу
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    global _banner_file_id
     await state.clear()
-    await message.answer(
-        f"Вітаємо в <b>{config.BUSINESS_NAME}</b>! 👋\n"
-        "Тут можна записатися на послугу за хвилину.",
-        reply_markup=kb.main_menu(),
+    caption = (
+        f"Вітаємо в <b>{config.BUSINESS_NAME}</b> 👋\n\n"
+        "Тут можна записатися без дзвінків:\n"
+        "<b>📅 Записатися</b> — обрати послугу й вільний час\n"
+        "<b>📋 Мої записи</b> — переглянути або скасувати\n\n"
+        "Натисніть кнопку в меню нижче 👇"
     )
+    if BANNER_PATH.exists():
+        photo = _banner_file_id or FSInputFile(BANNER_PATH)
+        sent = await message.answer_photo(photo, caption=caption, reply_markup=kb.main_menu())
+        _banner_file_id = sent.photo[-1].file_id
+    else:
+        await message.answer(caption, reply_markup=kb.main_menu())
 
 
 @router.message(Command("cancel"))
@@ -87,15 +116,21 @@ async def cmd_cancel(message: Message, state: FSMContext):
 @router.message(F.text == kb.BTN_PRICES)
 async def show_prices(message: Message, state: FSMContext):
     await state.clear()
-    lines = [f"• {title} — <b>{price} грн</b>" for title, price in config.SERVICES.values()]
-    await message.answer("💈 <b>Послуги і ціни</b>\n\n" + "\n".join(lines))
+    lines = [f"<b>{title}</b>\n└ {price} грн" for title, price in config.SERVICES.values()]
+    await message.answer(
+        f"💈 <b>Послуги і ціни</b>\n{DIVIDER}\n\n" + "\n\n".join(lines)
+        + "\n\n<i>Записатися — кнопка «📅 Записатися»</i>"
+    )
 
 
 @router.message(F.text == kb.BTN_CONTACTS)
 async def show_contacts(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        f"📍 {config.ADDRESS}\n📞 {config.PHONE}\n🕙 {config.WORK_HOURS_TEXT}"
+        f"📍 <b>Контакти</b>\n{DIVIDER}\n\n"
+        f"🏠  {config.ADDRESS}\n"
+        f"📞  {config.PHONE}\n"
+        f"🕙  {config.WORK_HOURS_TEXT}"
     )
 
 
@@ -359,6 +394,36 @@ async def reminder_loop(bot: Bot) -> None:
         await asyncio.sleep(60)
 
 
+async def setup_bot_profile(bot: Bot) -> None:
+    """Меню команд (кнопка «Меню» біля поля вводу) та опис бота, який видно до натискання «Почати»."""
+    user_cmds = [
+        BotCommand(command="start", description="Головне меню"),
+        BotCommand(command="cancel", description="Скасувати поточний запис"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand(command="today", description="Записи на сьогодні"),
+        BotCommand(command="week", description="Записи на 7 днів"),
+    ]
+    try:
+        await bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
+        if config.ADMIN_ID:  # адмін бачить у меню ще й свої команди
+            await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=config.ADMIN_ID))
+        await bot.set_my_short_description(
+            short_description=f"{config.BUSINESS_NAME} · запис на послуги онлайн, без дзвінків"
+        )
+        await bot.set_my_description(
+            description=(
+                f"💈 Запис у {config.BUSINESS_NAME} за 30 секунд\n\n"
+                "• Оберіть послугу, дату й вільний час\n"
+                "• Отримайте нагадування за 2 години до візиту\n"
+                "• Скасуйте запис в один дотик\n\n"
+                "Натисніть «Почати» 👇"
+            )
+        )
+    except Exception as e:  # оформлення не повинно заважати запуску бота
+        logging.warning("Не вдалося оновити меню або опис бота: %s", e)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not config.BOT_TOKEN:
@@ -367,6 +432,7 @@ async def main() -> None:
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+    await setup_bot_profile(bot)
     reminder_task = asyncio.create_task(reminder_loop(bot))  # noqa: F841 (тримаємо посилання)
     logging.info("Бот запущено. Зупинити: Ctrl+C")
     await dp.start_polling(bot)
