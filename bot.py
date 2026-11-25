@@ -19,10 +19,10 @@ from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 import config
 import db
 import keyboards as kb
+from phone import normalize_ua_phone
 from timeslots import available_dates, free_slots, human_date
 
 router = Router()
-PHONE_RE = re.compile(r"^\+?\d{10,13}$")
 
 
 class Booking(StatesGroup):
@@ -216,14 +216,26 @@ async def enter_name(message: Message, state: FSMContext):
 
 @router.message(Booking.phone, F.contact | F.text)
 async def enter_phone(message: Message, state: FSMContext):
-    raw = message.contact.phone_number if message.contact else message.text
-    phone = re.sub(r"[\s\-()]", "", raw or "")
-    if not PHONE_RE.match(phone):
-        await message.answer("Не схоже на номер телефону. Приклад: +380671234567")
-        return
-    if not phone.startswith("+"):
-        phone = "+" + phone if phone.startswith("380") else phone
-    await state.update_data(phone=phone)
+    if message.contact:
+        # Кнопка «Надіслати мій номер»: Telegram гарантує, що номер належить користувачу.
+        # Але через скрепку можна надіслати чужий контакт, тому перевіряємо, чий він.
+        if message.contact.user_id != message.from_user.id:
+            await message.answer("Це чужий контакт. Натисніть кнопку «📱 Надіслати мій номер» або введіть свій номер.")
+            return
+        digits = re.sub(r"\D", "", message.contact.phone_number)
+        phone = "+" + digits
+        verified = True
+    else:
+        phone = normalize_ua_phone(message.text)
+        verified = False
+        if phone is None:
+            await message.answer(
+                "Не схоже на український мобільний номер.\n"
+                "Приклади: +380671234567 або 0671234567.\n"
+                "Найпростіше — натиснути кнопку «📱 Надіслати мій номер»."
+            )
+            return
+    await state.update_data(phone=phone, phone_verified=verified)
     await state.set_state(Booking.confirm)
     data = await state.get_data()
     await message.answer("Номер отримано ✅", reply_markup=ReplyKeyboardRemove())
@@ -263,7 +275,11 @@ async def confirm_yes(call: CallbackQuery, state: FSMContext, bot: Bot):
     )
     await call.answer()
     username = f" (@{call.from_user.username})" if call.from_user.username else ""
-    await notify_admin(bot, f"🆕 <b>Новий запис #{booking_id}</b>{username}\n\n" + booking_text(data))
+    phone_note = "✅ номер підтверджено Telegram" if data.get("phone_verified") else "✍️ номер введено вручну"
+    await notify_admin(
+        bot,
+        f"🆕 <b>Новий запис #{booking_id}</b>{username}\n\n" + booking_text(data) + f"\n{phone_note}",
+    )
 
 
 # Клієнт натиснув стару кнопку після перезапуску бота або поза потрібним кроком
